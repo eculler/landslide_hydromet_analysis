@@ -1,0 +1,1231 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Libraries
+```{r}
+library(broom)
+library(cowplot)
+library(ggpubr)
+library(grid)
+library(tidyverse)
+library(lubridate)
+library(ncdf4)
+library(Peacock.test)
+library(raster)
+library(readxl)
+library(rgdal)
+library(sp)
+library(stargazer)
+library(zoo)
+```
+
+# Variables
+```{r variables}
+threshold <- 1
+strip.background <- 'grey90'
+```
+
+# Load data
+
+## Load landslides
+
+### Load landslide locations
+```{r load_landslides}
+size.levels <- c('medium', 'large', 'very_large')
+location.accuracy.levels <- c('exact', '1km', '5km', '10km', '25km', 
+                              '50km', '100km', '250km', 'unknown')
+allowed.triggers <- c('downpour', 'rain', 'flooding', 'continuous_rain')
+slide.list <- read_csv("data/landslide/landslides.original.csv",
+                       col_types = list('datetime' = col_datetime(format = "%m/%d/%y %H:%M"),
+                                        'type' = col_factor(),
+                                        'trigger' = col_factor(),
+                                        'size' = col_factor(ordered = T,
+                                                            levels = size.levels)
+                                       )
+) %>%
+  rename(slide.id=id, slide.date=datetime)
+```
+
+### Load landslide details from the NASA Glabal Landslide Catalog (GLC)
+```{r read_details}
+# Read in NASA GLC for additional landslide details
+slide.details.ct <- list('location_accuracy' = col_factor(ordered=T,
+                                                          levels = location.accuracy.levels))
+slide.details <- read_csv("data/landslide/nasa.glc.export.csv",
+                          col_types = slide.details.ct) %>%
+  dplyr::select(slide.id = event_id, location_accuracy, event_title, admin_division_name)
+```
+
+### Load Koppen climate classification
+```{r read_koppen}
+# Read in Koppen climate classification
+koppen.levels <- seq(1, 30)
+koppen.labels <- c('Af: Tropical, rainforest',
+                   'Am: Tropical, monsoon',
+                   'Aw: Tropical, savannah',
+                   'BWh: Arid, desert, hot',
+                   'BWk: Arid, desert, cold',
+                   'BSh: Arid, steppe, hot',
+                   'BSk: Arid, steppe, cold',
+                   'Csa: Temperate, dry summer, hot summer',
+                   'Csb: Temperate, dry summer, warm summer',
+                   'Csc: Temperate, dry summer, cold summer',
+                   'Cwa: Temperate, dry winter, hot summer',
+                   'Cwb: Temperate, dry winter, warm summer',
+                   'Cwc: Temperate, dry winter, cold summer',
+                   'Cfa: Temperate, no dry season, hot summer',
+                   'Cfb: Temperate, no dry season, warm summer',
+                   'Cfc: Temperate, no dry season, cold summer',
+                   'Dsa: Cold, dry summer, hot summer',
+                   'Dsb: Cold, dry summer, warm summer',
+                   'Dsc: Cold, dry summer, cold summer',
+                   'Dsd: Cold, dry summer, very cold winter',
+                   'Dwa: Cold, dry winter, hot summer',
+                   'Dwb: Cold, dry winter, warm summer',
+                   'Dwc: Cold, dry winter, cold summer',
+                   'Dwd: Cold, dry winter, very cold winter',
+                   'Dfa: Cold, no dry season, hot summer',
+                   'Dfb: Cold, no dry season, warm summer',
+                   'Dfc: Cold, no dry season, cold summer',
+                   'Dfd: Cold, no dry season, very cold winter',
+                   'ET: Polar, tundra',
+                   'EF: Polar, frost')
+slide.koppen <- read_csv("climate_gis/landslide_koppen.csv") %>%
+  transmute(slide.id, koppen = Beck_KG_V1) %>%
+  mutate(koppen = factor(koppen, levels = koppen.levels, labels = koppen.labels))
+
+slide.koppen %>% group_by(koppen) %>% tally %>% arrange(desc(n))
+```
+Only the Csb classification meets the qualification of n>50 for including a climate-specific threshold. This corresponds with the Csb (Mediterranean, cool) intensity-duration threshold in Guzzetti (2008).
+
+### Load landslide coordinates retrieved from Google Earth
+```{r read_scarp}
+# Read in Google Earth scarp coordinates
+get_decimal_coord <- function (coord_str, lat) {
+  col <- ifelse(lat, 1, 2)
+  coord_str <- str_split(coord_str, ', ', simplify=T)
+  coord_dms <- map_dbl(coord_str[,col], 
+                       ~possibly(~as.numeric(char2dms(., chd = "°", chm = "\'", chs = "\"")), 
+                                 NA_real_)(.))
+  coord_dms
+}
+slide.scarp <- read_excel("data/landslide/verified.locations.xlsx", sheet = 'Visible Scarps') %>%
+  dplyr::select(slide.id = ID, glc.lat=`Lat.`, glc.lon=`Long.`, coord.str=`Google Earth Coordinates`) %>%
+  mutate(ge.lat = get_decimal_coord(coord.str, lat=T),
+         ge.lon = get_decimal_coord(coord.str, lat=F),
+         ge.lat = ifelse(is.na(ge.lat), glc.lat, ge.lat),
+         ge.lon = ifelse(is.na(ge.lon), glc.lon, ge.lon),
+         is.exact = T)
+```
+
+### Join landslides
+```{r join_slide}
+#
+slide.full <- slide.list %>%
+  left_join(slide.details, by = c('slide.id')) %>%
+  left_join(slide.scarp %>% dplyr::select(slide.id, ge.lat, ge.lon, is.exact), by='slide.id') %>%
+  left_join(slide.koppen, by = 'slide.id') %>%
+  mutate(slide.index = row_number()) 
+slide.allprecip <- slide.full %>%
+  filter(location_accuracy <= '10km' | is.exact, # Apply study restrictions
+         trigger %in% allowed.triggers) %>%
+  droplevels() %>%
+  mutate(is.exact = ifelse(is.na(is.exact), F, is.exact), # Use exact coordinates over glc
+         lat = ifelse(!is.na(ge.lat), ge.lat, lat),
+         lon = ifelse(!is.na(ge.lon), ge.lon, lon),
+         type = fct_collapse(type,
+                             'Mudslide or debris flow' = c('mudslide', 'debris_flow'),
+                             'Rock fall' = 'rock_fall',
+                             other_level = 'Landslide')) %>%
+  droplevels()
+
+# Check data
+summary(slide.allprecip)
+```
+
+
+## Load precipitation
+```{r}
+precip.mrms <- read_table2("data/precipitation/All_Landslides_PRE_MRMS.txt",
+                          col_names = c('year', 'month', 'day', 'hour', 
+                                        seq(1, nrow(slide.full))
+                                        )
+                          ) %>%
+  mutate(datetime = ymd_h(str_c(year, '-', month, '-', day, ' ', hour)),
+         source = 'MRMS',
+         delta.t = 1) %>%
+  dplyr::select(-year, -month, -day, -hour) %>%
+  gather(key = 'landslide', value = 'precipitation', -datetime, -source, -delta.t) %>%
+  mutate(landslide=as.integer(landslide),
+         precipitation = ifelse(precipitation < 0, NA, precipitation)) %>%
+  left_join(slide.full %>% dplyr::select(slide.id, slide.index), 
+            by=c('landslide'='slide.index')) %>%
+  dplyr::select(-landslide)
+
+precip.nldas <- list.files(path = 'data/precipitation/nldas/verified', 
+                           pattern = '^nldas.*.csv', full.names = T) %>%
+  map(read_csv) %>%
+  bind_rows %>%
+  mutate(source = 'NLDAS-2',
+         delta.t = 1)
+
+precip.imerge <- list.files(path = 'data/precipitation/imerge/verified', 
+                           pattern = '^imerge.*.csv', full.names = T) %>%
+  map(read_csv) %>%
+  bind_rows %>%
+  mutate(source = 'IMERG-Early',
+         delta.t = 0.5,
+         precipitation = precipitation * delta.t) # mm/hr to mm
+
+precip.imergf <- list.files(path = 'data/precipitation/imergf/verified', 
+                           pattern = '^imergf.*.csv', full.names = T) %>%
+  map(read_csv) %>%
+  bind_rows %>%
+  mutate(source = 'IMERG-Final',
+         delta.t = 0.5,
+         precipitation = precipitation * delta.t) # mm/hr to mm
+
+precip <- bind_rows(precip.imergf, precip.imerge, precip.mrms, precip.nldas) %>%
+  filter(slide.id %in% pull(slide, slide.id),
+         as_date(datetime) >= ymd('2015-06-01'),
+         as_date(datetime) < ymd('2018-06-30')) %>%
+  mutate(precipitation = ifelse(is.na(precipitation), 0, precipitation),
+         source = as_factor(source))
+
+precip <- precip %>%
+  mutate(source = as_factor(source),
+         source = fct_recode(source, `IMERG-Final` = 'IMERG-Final', 
+                              `IMERG-Early` = 'IMERG-Early'))
+precip %>% summary
+```
+
+```{r}
+precip.slide.date <- precip %>%
+  left_join(slide, by='slide.id') %>%
+  filter(as_date(slide.date) == as_date(datetime)) 
+precip.slide.date %>%
+  group_by(slide.id, source) %>%
+  summarize(precipitation = ifelse(precipitation > threshold * delta.t, precipitation, 0),
+            precipitation = sum(precipitation),
+            is.exact = all(is.exact)) %>%
+  mutate(no.precip = precipitation == 0) %>%
+  group_by(slide.id) %>%
+  summarize(no.precip = all(no.precip),
+            is.exact = all(is.exact)) %>% 
+  count(no.precip, is.exact)
+```
+
+### Check that precipitation is available for landslide dates
+```{r}
+precip %>%
+  inner_join(slide, by=c('slide.id', 'datetime' = 'slide.date')) %>%
+  right_join(slide, by=c('slide.id'))
+```
+
+# Storms
+
+## Identify all storms
+```{r group_precipitation}
+precip.groups <- precip %>%
+  group_by(slide.id, source) %>%
+  # Ignore precipitation below threshold
+  mutate(precipitation = ifelse(precipitation > threshold * delta.t, precipitation, 0),
+         # Ignore gaps less than 24 hours
+         sum_12h.r = rollapply(precipitation, 12 / unique(delta.t), sum, align = 'right', partial = T),
+         sum_12h.l = rollapply(precipitation, 12 / unique(delta.t), sum, align = 'left', partial = T),
+         # Eliminate float arithmetic errors
+         sum_12h.r = ifelse(sum_12h.r < 1e-3, 0, sum_12h.r),
+         sum_12h.l = ifelse(sum_12h.l < 1e-3, 0, sum_12h.l),
+         # Mark the start of each storm by changing the index
+         is.storm.r = sum_12h.r > 0,
+         is.storm.l = sum_12h.l > 0,
+         storm.start.id = cumsum((is.storm.r - lag(is.storm.r, default = F)) > 0),
+         storm.end.id = cumsum((is.storm.l - lag(is.storm.l, default = F)) < 0)) %>%
+  # Filter out groupings with no precipitation
+  group_by(slide.id, source, storm.start.id, storm.end.id) %>%
+  filter(any(precipitation > 0 )) %>%
+  left_join(slide.allprecip %>% select(slide.id, slide.date), by=c('slide.id')) %>%
+  # Mark landslide-triggering precipitation
+  mutate(is.trigger = any(as_date(datetime) == as_date(slide.date))) %>%
+  rename(storm.id = storm.start.id) %>%
+  ungroup
+```
+
+## Calculate storm characteristics
+```{r calc_storm_characteristics}
+calc.storm.characteristics <- function (precip) {
+  precip %>%
+    # Calculate storm characteristics
+    summarize(depth = sum(precipitation),
+              duration = sum(delta.t),
+              delta.t = unique(delta.t),
+              intensity = depth / duration,
+              peak_intensity = max(precipitation / delta.t, na.rm =T),
+              start.datetime = min(datetime),
+              end.datetime = max(datetime) + dhours(delta.t),
+              is.trigger = any(is.trigger)) %>%
+    ungroup
+}
+
+storm.all <- precip.groups  %>%
+  group_by(slide.id, source, storm.id) %>%
+  calc.storm.characteristics
+```
+
+## Calculate triggering storm characteristics
+```{r}
+precip.trigger <- precip.groups %>%
+  # Select groups overlapping landslide date
+  group_by(slide.id, storm.id, source) %>%
+  filter(any(as_date(datetime) == as_date(slide.date)),
+         # Remove precipitation from after the landslide
+         as_date(datetime) <= as_date(slide.date)) %>% 
+  ungroup
+
+# Calculate storm characteristics
+storm.trigger <- precip.trigger %>%
+  group_by(slide.id, source) %>%
+  calc.storm.characteristics
+storm.trigger %>% summary
+precip.trigger
+```
+
+## Filter landslides by precipitation occurrence
+```{r}
+slide <- slide.allprecip %>%
+  filter(slide.id %in% unique(storm.trigger$slide.id))
+
+# Save included landslide locations for GIS use
+write_csv(slide %>% select(slide.id, lon, lat), 
+          file = 'data/landslide/landslide.included.csv')
+```
+
+## What data are missing?
+
+```{r}
+storm.all %>%
+  mutate(duration2 = as.numeric(start.date %--% end.date, "hours")) %>%
+  select(slide.id, source, start.date, end.date, duration, duration2, depth) %>%
+  filter(duration != duration2)
+```
+
+```{r}
+precip %>%
+  filter(source == 'IMERG-Final', slide.id == 7392, 
+         datetime > ymd(20150719), datetime <= ymd(20150721),
+         precipitation > delta.t * threshold)
+```
+```{r}
+precip %>%
+  left_join(slide, by = 'slide.id') %>%
+  filter(as_date(datetime) == as_date(slide.date)) %>%
+  filter(precipitation > 1) %>%
+  group_by(source, slide.id) %>%
+  summarize(precipitation = sum(precipitation)) %>% 
+  summary
+```
+
+```{r}
+precip %>%
+  anti_join(storm) %>%
+  group_by(slide.id, source) %>%
+  summarize(missing = T) %>%
+  group_by(source) %>%
+  count()
+```
+
+## Download frequency
+
+```{r download_frequencies}
+get.frequency <- function (lat, lon, layer, depth, nc, ari.v, lon.v, lat.v) {
+  ## Subset the precipitation frequency data
+  # Calculate the spacing between grid points.
+  cell.size <- mean(diff(lat.v))
+  # Find the index for the location
+  y <- round((lat - min(lat.v)) / cell.size) + 1
+  x <- round((lon - min(lon.v)) / cell.size) + 1
+  
+  # Read data
+  if (x > length(lon.v) | y > length(lat.v)) {return(NA)}
+  depths <- ncvar_get(nc, layer, c(1, x, y), c(length(ari.v), 1, 1))
+  if (is.na(depths[1])) {return(NA)}
+  depth.i <- which.min(abs(depths - depth))
+  ari.v[depth.i]
+}
+
+get.frequencies <- function (lat, lon, layer, depth) {
+  # Open a connection to the dataset
+  nc <- nc_open('https://hdsc.nws.noaa.gov/thredds/dodsC/data/NOAA_Atlas_14_CONUS.nc')
+  ## Query the axes data (lat, lon, ari)
+  ari.v <- ncvar_get(nc,'ari')
+  lon.v <- ncvar_get(nc, 'lon')
+  lat.v <- ncvar_get(nc, 'lat')
+  frequencies <- pmap_dbl(list(lat, lon, layer, depth), 
+                          ~get.frequency(..1, ..2, ..3, ..4, 
+                                         nc, ari.v, lon.v, lat.v))
+  nc_close(nc)
+  frequencies
+}
+
+get.return.periods <- function (precip) {
+  precip %>%
+    group_by(slide.id, source) %>%
+    summarize(pf_168_hr = max(rollsum(precipitation, 168 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_096_hr = max(rollsum(precipitation,  96 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_072_hr = max(rollsum(precipitation,  72 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_048_hr = max(rollsum(precipitation,  48 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_024_hr = max(rollsum(precipitation,  24 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_012_hr = max(rollsum(precipitation,  12 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_006_hr = max(rollsum(precipitation,   6 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_003_hr = max(rollsum(precipitation,   3 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_002_hr = max(rollsum(precipitation,   2 / unique(delta.t), na.pad = T), na.rm = T),
+              pf_001_hr = max(rollsum(precipitation,   1 / unique(delta.t), na.pad = T), na.rm = T)) %>%
+    gather(key = 'layer', value = 'depth', -slide.id, -source) %>%
+    filter(depth > -Inf) %>%
+    left_join(slide, by = c('slide.id')) %>%
+    mutate(depth.in = depth / 25.4,
+           return.period = get.frequencies(lat, lon, layer, depth.in)) 
+}
+
+storm.period.trigger.all <- precip.trigger %>%
+  get.return.periods 
+
+storm.period.trigger <- storm.period.trigger.all %>%
+  group_by(slide.id, source) %>%
+  summarize(return.period = max(return.period)) %>%
+  dplyr::select(slide.id, source, return.period) %>%
+  left_join(trigger.storm, by=c('slide.id', 'source')) %>%
+  left_join(slide %>% dplyr::select(slide.id, is.exact), by='slide.id') %>%
+  ungroup()
+
+storm.freq.max1 <- storm.freq.max %>%
+  mutate(source = str_replace(source, ' ', '-'))
+
+storm.period.trigger <- storm.trigger %>%
+  left_join(storm.freq.max1 %>% select(slide.id, source, return.period),
+            by=c('slide.id', 'source')) %>%
+  left_join(slide %>% dplyr::select(slide.id, is.exact), by='slide.id') %>%
+  ungroup()
+
+storm.period.trigger %>%
+  filter(!is.na(return.period)) %>%
+  group_by(slide.id) %>%
+  summarize(all.2year = all(return.period==2)) %>%
+  group_by(all.2year) %>%
+  tally()
+  
+```
+
+# Analysis
+## Landslide dataset characteristics
+### How many landslides of each type?
+```{r slide_types}
+# Find landslide type distribution
+slide %>%
+  group_by(type) %>%
+  summarise(n = n(),  percentage = n() / nrow(slide) * 100)
+```
+
+### How many landslides of each location accuracy?
+```{r slide_accuracy}
+slide %>%
+  filter(!is.exact) %>%
+  group_by(location_accuracy) %>%
+  summarise(n = n(),  percentage = n() / nrow(slide) * 100)
+```
+## Map landslide sites
+
+```{r load_topo}
+topo.raster <- raster('data/na_elevation.tif')
+topo.df <- as.data.frame(topo.raster, xy=T, na.rm=T) 
+topo.df.cut <- topo.df %>%
+  mutate(na_elevation = ifelse(na_elevation > 3000, 3000, na_elevation))
+```
+
+```{r load_boundaries}
+boundaries <- readOGR("data/boundaries", "boundaries_wgs84")
+boundaries_df <- fortify(boundaries)
+```
+
+```{r plot_map}
+ocean.col <- 'turquoise3'
+n.verified <- slide %>% filter(is.exact) %>% nrow
+n.approx <- slide %>% filter(!is.exact) %>% nrow 
+landslide.labels <- c(`TRUE` = str_c('Verified landslide\nlocation (n=', n.verified, ')'),
+                      `FALSE`=str_c('Approximate landslide\nlocation (n=', n.approx, ')'))
+ggplot() +
+  borders(database = 'world', regions = c('Canada', 'USA', 'Mexico'), 
+          fill='white', colour=NA) +
+  geom_raster(data = topo.df.cut, aes(x = x, y = y, fill = na_elevation)) +
+  geom_path(data = boundaries_df, 
+            aes(x = long, y = lat, group = group),
+            color = 'black', size = .2) +
+  borders(database = 'world', regions = c('Canada', 'USA', 'Mexico'), 
+          fill=NA, colour='black', size=0.6) +
+  borders(database = 'lakes', 
+          fill=ocean.col, colour='black', size=0.6) +
+  geom_point(data = slide %>% arrange(is.exact), 
+             aes(x = lon, y = lat, shape = is.exact, color = is.exact),
+             stroke=1) +
+  scale_shape_manual('Landslide locations (n=177)', 
+                     values = c(`FALSE`=3, `TRUE`=4),
+                     labels = landslide.labels) +
+  scale_color_manual('Landslide locations (n=177)',
+                     values = c(`FALSE`='blue', `TRUE`='white'),
+                     labels = landslide.labels) +
+  scale_fill_gradientn('Elevation (m)', colors=terrain.colors(10)[2:10],
+                       na.value=ocean.col) +
+  theme_bw() +
+  labs(x = '', y = '') +
+  coord_cartesian(ylim = c(24, 57), xlim = c(-140, -60), expand = F) +
+  guides(shape = guide_legend(order = 2),
+         color = guide_legend(order = 2),
+         fill = guide_colorbar(order = 1)) +
+  theme(panel.grid = element_blank(), 
+        panel.background = element_rect(fill=ocean.col),
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        legend.position = c(0.17, 0.32),
+        legend.key = element_rect(fill = terrain.colors(10)[[2]]),
+        legend.spacing.y = unit(5, "pt"))
+ggsave('..figures/site_map.png', width = 7, height = 4.5)
+ggsave('..figures/figure_1_site_map.tiff', width = 7, height = 4.5, dpi = 600)
+```
+
+## Landslide type precipitation distribution validation
+```{r type_distributions, fig.height = 2, fig.width = 4}
+storm.slide.type <- storm.trigger %>%
+  left_join(slide, by='slide.id')  %>%
+  transmute(slide.id, source, type, `Intensity (mm/h)` = intensity, `Duration (h)` = duration) %>%
+  pivot_longer(c(`Intensity (mm/h)`, `Duration (h)`)) %>%
+  ungroup
+storm.slide.type.summary <- storm.slide.type %>%
+  group_by(type, name) %>%
+  summarize(max = max(value), value = mean(value))
+storm.slide.type %>%
+  ggplot() +
+  facet_wrap(vars(name), scales = 'free', strip.position = 'bottom') +
+  geom_density(aes(x=value, group=type, fill=type),
+               alpha = 0.5, color = 'black') +
+  geom_vline(data = storm.slide.type.summary,
+             aes(xintercept = value, color = type)) +
+  geom_text(data = storm.slide.type.summary %>%
+              group_by(name) %>%
+              summarize(max = max(max)) %>%
+              mutate(label = c('a', 'b'), y = c(.75, 1)),
+            aes(x = max, y = y, label = label)) +
+  theme_bw() +
+  scale_x_log10() +
+  labs(x = '', y = '', color = 'Landslide type:', fill = 'Landslide type:') +
+  theme(strip.placement = "outside",
+        axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        legend.position = 'bottom')
+ggsave('..figures/type_distribution.png', width = 8, height = 4)
+ggsave('..figures/figure_2_type_distribution.tiff', width = 8, height = 4, dpi=300)
+```
+
+```{r type_validation, fig.width=3, fig.height = 1.5 }
+storm.all %>% 
+    left_join(slide, by = 'slide.id') %>%
+    mutate(ifelse(type=='debris_flow', 'mudslide', type),
+           ifelse(!(type %in% c('landslide', 'mudslide', 'rock_fall')), 'landslide', type)) %>%
+    filter(type %in% c('landslide', 'mudslide', 'rock_fall')) %>%
+    droplevels() %>%
+    ggplot() +
+    facet_wrap(facets =vars(source), nrow =2) +
+    facet_grid(cols = vars(source)) +
+    geom_point(aes(x = duration, y = intensity, color = type), alpha = 0.8) +
+    scale_x_log10('Duration (h)') +
+    scale_y_log10('Intensity (mm/h)') +
+    scale_color_brewer('', 
+                       palette = 'Paired', 
+                       labels = c('true'='Landslide-triggering storms',
+                                  'false'='All storms 2015-2020')) +
+    scale_alpha_manual('',
+                       values = c('true'=0.8,'false'=0.1),
+                       labels = c('true'='Landslide-triggering storms',
+                                  'false'='All storms 2015-2020'),
+                       guide = F)  +
+    labs(linetype='Intensity-Duration Threshold:') +
+    theme_bw() +
+    theme(strip.background = element_rect(fill=strip.background),
+          legend.position = 'bottom')
+
+ggsave('..figures/type_validation.png', width = 12, height = 8)
+```
+
+## Cumulative precipitation at example sites
+```{r landslide_precip, fig.width = 5, fig.height = 4}
+slide.subset <- tibble(slide.id = c(7761, 8992, 10426, 9123, 10422),
+                       interpretation = c('All products are similar',
+                                          'Products are correlated but volume is off',
+                                          'Total depth matches; intermediate diverges',
+                                          'IMERG-Early outlier',
+                                          'No landslide trigger detected')) %>%
+  left_join(slide.allprecip, by='slide.id') %>%
+  mutate(details = as_factor(str_c('Date: ', as_date(slide.date), 
+                                   ' -- Location: (', 
+                                   round(lat, 1), ', ', 
+                                   round(lon, 1), ')')),
+         label = c('a', 'b', 'c', 'd', 'e'),
+         event_title = as_factor(event_title))
+
+labels <- precip %>%
+  right_join(slide.subset, by='slide.id') %>%
+  filter(datetime < as_datetime(slide.date),
+         datetime > as_datetime(slide.date - days(30))) %>%
+  group_by(source, slide.id) %>%
+  mutate(precipitation = ifelse(is.na(precipitation), 0, precipitation),
+         precipitation = cumsum(precipitation)) %>%
+  group_by(slide.id) %>%
+  summarize(label = unique(label), x = min(datetime), y = max(precipitation) * 0.9,
+            event_title = unique(event_title), details = unique(details))
+
+precip %>%
+  filter(slide.id %in% slide.subset$slide.id) %>%
+  inner_join(slide.subset, by='slide.id') %>%
+  group_by(source, slide.id) %>%
+  filter(datetime < as_datetime(slide.date),
+         datetime > as_datetime(slide.date - days(30))) %>%
+  mutate(precipitation = ifelse(is.na(precipitation), 0, precipitation),
+         precipitation = cumsum(precipitation)) %>%
+  ggplot() +
+  facet_wrap(vars(details), ncol=2, scales='free') +
+  geom_line(aes(x = datetime, y = precipitation, group = source, color = source), size=1.5, alpha = 0.6) +
+  geom_vline(data = slide.subset, 
+             aes(xintercept = as_datetime(slide.date))) +
+  geom_label(data = labels, aes(label=label, x=x, y=y)) +
+  labs(y = 'Cumulative precipitation (mm)', x = '', color = 'Data Source:') +
+  guides(color=guide_legend(keywidth=unit(.1, 'npc'), keyheight=unit(.04, 'npc'))) +
+  theme_bw() +
+  theme(legend.position = c(0.7, .15),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))
+ggsave('..figures/example_landslide_precipitation.png', width = 10, height = 8)
+ggsave('..figures/figure_3_cumulative_precip.tiff', width = 10, height = 8, dpi = 600)
+```
+
+## Rank and z-score
+
+```{r}
+precip.summary <- precip %>%
+  right_join(slide %>% dplyr::select(slide.id, slide.date), by = 'slide.id') %>%
+  mutate(date = as_date(datetime),
+         day.of.landslide = date == as_date(slide.date)) %>%
+  group_by(slide.id, source, date, day.of.landslide) %>% # Daily precip
+  summarize(precipitation = sum(precipitation)) %>% 
+  group_by(slide.id, date) %>% # Get rank
+  mutate(rank = rank(precipitation)) %>%
+  filter(precipitation > 0) %>% # Calculate z-scores
+  group_by(slide.id, source) %>%
+  mutate(z.score = scale(precipitation)) %>%
+  dplyr::select(slide.id, source, date, day.of.landslide, # Prepare for plotting
+                precipitation, rank, z.score) %>%
+  gather("statistic", "value", -slide.id, -source, -date, -day.of.landslide)  %>%
+  mutate(statistic = as_factor(statistic),
+         source = as_factor(source),
+         day.of.landslide = ifelse(day.of.landslide, 'Day of landslide', 'All days')) %>%
+  ungroup()
+precip.summary
+```
+
+```{r plot_summary}
+plot.summary <- function (stat, y.label, labels=c('a', 'b')) {
+  label.df <- precip.summary %>% 
+    filter(statistic == stat) %>%
+    mutate(y = max(value)) %>%
+    group_by(day.of.landslide, y) %>%
+    summarize(x = fct_unique(source)[[4]]) %>%
+    ungroup %>%
+    mutate(facet_label=labels)
+  precip.summary %>%
+  filter(statistic == stat) %>%
+  ggplot() +
+  facet_grid(rows = vars(day.of.landslide)) +
+  geom_boxplot(aes(x=source, y=value, fill=source)) +
+  geom_label(data = label.df, aes(x = x, y = y, label = facet_label),
+             hjust = -0.5) +
+  scale_fill_discrete(guide=F) +
+  coord_flip() +
+  theme_bw() +
+  labs(y=y.label, x='') +
+  theme(axis.text.x = element_text(angle=90, hjust=1))
+}
+
+```
+
+```{r summary_combo, fig.height= 2, fig.width = 5}
+plot.rank <- plot.summary('rank', 'Rank among four products') +
+  theme(strip.text = element_blank()) +
+  scale_y_continuous(expand=expand_scale(mult=c(0.05, 0.1)), 
+                     labels=function (x) sprintf("%3.0f", x))
+plot.z <- plot.summary('z.score', 'z-score for product among all dates', c('c', 'd')) +
+  scale_y_continuous(expand=expand_scale(mult=c(0.05, 0.1)), trans='pseudo_log') +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        strip.background = element_rect(fill=strip.background))
+plot_grid(plot.rank, plot.z, nrow = 1)
+ggsave('..figures/summary.png', width = 10, height = 4)
+ggsave('..figures/figure_4_summary.tiff', width = 10, height = 4, dpi = 300)
+```
+
+## Product comparison against ensemble mean
+```{r}
+calc.means <- function (d) {
+  d %>%
+    dplyr::select(slide.id, storm.id, source, is.exact, 
+                  depth, duration, return.period, intensity, peak_intensity) %>%
+    pivot_longer(c(-slide.id, -storm.id, -source, -is.exact), names_to='measurement') %>%
+    mutate(measurement = fct_recode(measurement,
+                                    `Depth (mm)` = 'depth',
+                                    `Duration (h)` = 'duration',
+                                    `Return period (y)` = 'return.period',
+                                    `Total intensity (mm/h)` = 'intensity',
+                                    `Peak intensity (mm/h)` = 'peak_intensity')) %>%
+    group_by(slide.id, storm.id, measurement) %>%
+    mutate(ensemble.mean = mean(value, na.rm=T)) 
+}
+
+plot.scatter <- function (data, all.data, labels = c('a', 'b', 'c', 'd', 'e'),
+                          point.alpha = 0.6) {
+  plt <- data %>%
+    ggplot() +
+    facet_wrap(facets = vars(measurement), nrow = 1, 
+               scales = 'free',
+               labeller = label_wrap_gen()) +
+    geom_abline() +
+    geom_point(aes(x = ensemble.mean, y = value, color = source), alpha=point.alpha, size=0.3) +
+    geom_point(data = all.data,
+               aes(x = value, y = value), alpha = 0)  +
+    geom_smooth(aes(x = ensemble.mean, y = value, group = source, color = source, fill = source), 
+                alpha = 0.3, method = 'lm', formula = 'y ~ x') +
+    scale_fill_discrete(guide = F) +
+    scale_x_log10() + scale_y_log10(labels=function (x) sprintf("%.0f", x)) +
+    theme_bw() +
+    labs(x = 'Ensemble mean', y = 'Individual product value', color = '')
+  lay <- ggplot_build(plt)$layout
+  scales.x <- lay$panel_scales_x
+  scales.y <- lay$panel_scales_y
+  label.df <- tibble(x = map_dbl(scales.x, ~10^(.$range$range[1])), 
+                     y = map_dbl(scales.y, ~10^(.$range$range[2])),
+                     facet_label = labels,
+                     measurement = fct_unique(data$measurement))
+  plt + 
+    geom_label(data = label.df, aes(x = x, y = y, label = facet_label),
+               vjust = 1, hjust = 0)
+}
+```
+
+```{r plot_scatter_all_trigger, fig.height=1.5, fig.width=6}
+scatter.trigger <- storm.period.trigger %>%
+    dplyr::select(slide.id, source, is.exact, 
+                  depth, duration, return.period, intensity, peak_intensity) %>%
+    pivot_longer(c(-slide.id, -source, -is.exact), names_to='measurement') %>%
+    mutate(measurement = fct_recode(measurement,
+                                    `Depth (mm)` = 'depth',
+                                    `Duration (h)` = 'duration',
+                                    `Return period (y)` = 'return.period',
+                                    `Total intensity (mm/h)` = 'intensity',
+                                    `Peak intensity (mm/h)` = 'peak_intensity')) %>%
+    group_by(slide.id,measurement) %>%
+    mutate(ensemble.mean = mean(value, na.rm=T)) 
+storm.period.trigger %>% summary
+scatter.trigger %>% summary
+plot.scatter(scatter.trigger, scatter.trigger)
+ggsave('..figures/scatter_ensemble_mean.png', width = 12, height = 3)
+```
+
+```{r plot_scatter_exact_trigger, fig.height=1.5, fig.width=6}
+plot.scatter(scatter.trigger %>% filter(is.exact), scatter.trigger)
+ggsave('..figures/scatter_ensemble_mean_exact.png', width = 12, height = 3)
+storm.trigger %>% summary
+```
+
+```{r plot_scatter_all, fig.height=1.5, fig.width=6}
+scatter <- storm.all %>% 
+  right_join(slide %>% select(slide.id, is.exact), by='slide.id') %>%
+  mutate(return.period = NA)%>%
+  dplyr::select(slide.id, storm.id, source, is.exact, 
+                depth, duration, return.period, intensity, peak_intensity) %>%
+  pivot_longer(c(-slide.id, -storm.id, -source, -is.exact), names_to='measurement') %>%
+  mutate(measurement = fct_recode(measurement,
+                                  `Depth (mm)` = 'depth',
+                                  `Duration (h)` = 'duration',
+                                  `Return period (y)` = 'return.period',
+                                  `Total intensity (mm/h)` = 'intensity',
+                                  `Peak intensity (mm/h)` = 'peak_intensity')) %>%
+  group_by(slide.id, storm.id, measurement) %>%
+  mutate(ensemble.mean = mean(value, na.rm=T)) %>%
+  filter(measurement != 'Return period (y)') %>%
+  droplevels()
+
+plot.scatter(scatter, scatter, point.alpha = 0.1, labels = c('k', 'l', 'm', 'n'))
+ggsave('..figures/scatter_ensemble_mean.png', width = 12, height = 3)
+```
+
+```{r plot_scatter_combo, fig.height=2.5, fig.width=4.5}
+scatter.minmax <- scatter %>% 
+  group_by(measurement) %>% 
+  filter(value %in% c(min(value), max(value))) %>% 
+  group_by(measurement, value) %>%
+  summarize()
+
+# Legend
+scatter.legend <- plot.scatter(scatter.trigger, scatter.minmax) +
+  labs(y = '') +
+  theme(strip.background = element_rect(fill=strip.background))
+scatter.legend <- cowplot::get_legend(scatter.legend)
+
+# Top row: all triggering storms
+scatter.all.plot <- plot.scatter(scatter.trigger, scatter.minmax) +
+  labs(x = '', y = '') +
+  theme(legend.position = "none",
+        strip.text.y = element_text(),
+        strip.background = element_rect(fill=strip.background))
+scatter.all.label <- ggdraw() +
+  draw_grob(rectGrob(gp = gpar(fill = strip.background),
+                     height = unit(0.8, "npc"), vjust = 0.44)) +
+  draw_label("All landslide locations", colour = 'black',
+             x = 0.1, vjust = -0.2, hjust = 0.525, angle = -90, size=8)
+scatter.all <- plot_grid(scatter.all.plot, scatter.all.label, 
+                         nrow = 1, rel_widths = c(1, 0.024))
+
+
+# Middle row: exact locations
+scatter.exact.plot <- plot.scatter(scatter.trigger %>% filter(is.exact), 
+                                   scatter.minmax,
+                                   labels = c('f', 'g', 'h', 'i', 'j')) +
+  labs(x = '', y = '') +
+  theme(legend.position='none',
+        strip.text = element_blank())
+scatter.exact.label <- ggdraw() +
+  draw_grob(rectGrob(gp = gpar(fill = strip.background),
+                     height = unit(0.9, "npc"), vjust = 0.5)) +
+  draw_label("Verified landslide locations", colour = 'black',
+             x = 0.1, vjust = -0.2, hjust = 0.525, angle = -90, size=8)
+scatter.exact <- plot_grid(scatter.exact.plot, scatter.exact.label, 
+                           nrow = 1, rel_widths = c(1, 0.024))
+# Bottom row: all storms 
+scatter.clim.plot <- plot.scatter(scatter, scatter.minmax %>% 
+                                    filter(measurement != 'Return period (y)') %>% 
+                                    droplevels, 
+                                  point.alpha = 0.1, 
+                                  labels = c('k', 'l', 'm', 'n')) +
+  labs(y = '') +
+  theme(legend.position='none',
+        strip.text = element_blank())
+scatter.clim.label <- ggdraw() +
+  draw_grob(rectGrob(gp = gpar(fill = strip.background),
+                     height = unit(0.8, "npc"), vjust = 0.44)) +
+  draw_label("Climatology 2015-2018", colour = 'black',
+             x = 0.1, vjust = -0.2, hjust = 0.55, angle = -90, size=8)
+scatter.clim <- plot_grid(scatter.clim.plot, scatter.clim.label, scatter.legend,
+                          nrow = 1, rel_widths = c(4, 0.12, 1))
+
+scatter.y.axis <- ggdraw() +
+  draw_label("Individual product value", size = 12,
+             x = 0.1, vjust = 1, hjust = 0.4, angle = 90)
+scatter.plots <- plot_grid(scatter.all, scatter.exact, scatter.clim,  
+                           rel_heights = c(3, 2.7, 2.7), ncol = 1)
+plot_grid(scatter.y.axis, scatter.plots,
+          nrow = 1, rel_widths = c(0.015, 1))
+ggsave('..figures/scatter_ensemble_mean.png', width = 9, height = 5)
+ggsave('..figures/figure_5_scatter.tiff', width = 9, height = 5, dpi=600)
+```
+
+```{r percent_difference}
+storm.freq.pctdiff <- storm.period.trigger %>%
+  calc.means %>%
+  filter(measurement %in% c('Depth (mm)', 'Duration (h)')) %>%
+  mutate(percent.difference = (value - ensemble.mean) / ensemble.mean * 100,
+         is.exact = ifelse(is.exact, 'Exact location', 'Approximate location'))
+
+storm.freq.pctdiff %>%
+  group_by(measurement) %>%
+  mutate(median.pctdiff = median(abs(percent.difference))) %>%
+  group_by(measurement, is.exact) %>%
+  mutate(gt.median = abs(percent.difference) > median.pctdiff,
+         gt.median = ifelse(gt.median, 'gt.median', 'lt.median')) %>%
+  group_by(measurement, is.exact, gt.median) %>%
+  tally() %>% 
+  pivot_wider(c('measurement', 'is.exact'), names_from = gt.median, values_from = n) %>%
+  mutate(pct.gt.median = gt.median / (gt.median + lt.median) * 100)
+
+storm.freq.pctdiff %>%
+  ggplot() +
+  facet_wrap(c('measurement'), nrow = 1) +
+  geom_boxplot(aes(x = is.exact, y = abs(percent.difference))) +
+  theme_minimal() +
+  labs(x = '', y = 'Absolute percent difference from mean')
+```
+
+## Return period vs. Peak intensity
+
+```{r fig.width=2, fig.height=2}
+storm.period.trigger %>%
+  drop_na(return.period) %>%
+  ggplot(aes(x = peak_intensity, y = return.period)) +
+  geom_point() +
+  theme_minimal() +
+  scale_y_log10() +
+  geom_smooth(method = 'glm', formula = 'y~x', se=F, 
+              color='black') +
+  labs(x='Peak Intesity (mm/h)', y = 'Return period (y)') +
+  theme(legend.position = 'bottom')
+
+ggsave('..figures/scatter_peakintensity_period.png', width = 4, height = 4)
+ggsave('..figures/figure_6_scatter_peakintensity_period.tiff', width = 4, height = 4, dpi=300)
+```
+
+```{r}
+storm.freq.max %>%
+  ggplot() +
+  facet_wrap(vars(source), nrow=1) +
+  geom_boxplot(aes(x=as_factor(return.period), y=peak_intensity, fill=source)) +
+  geom_text(data = storm.freq.max %>%
+              group_by(source, return.period) %>% 
+              summarize(n=n()),
+            aes(x = as_factor(return.period), y = 90, label = str_c('n=', n)), 
+            angle=90, size=3, hjust=1) +
+  scale_fill_discrete(guide=F) +
+  theme_bw() +
+  labs(x='Storm return period (years)', y = 'Peak intensity (mm/h)', fill='Dataset:') +
+  theme(axis.text.x = element_text(angle=90, hjust = 1))
+ggsave('..figures/frequency_peak.png', width = 6, height = 4)
+```
+
+## Intensity-duration threshold
+
+### Intensity-duration figures
+```{r plot_id_threshold}
+storm.max.duration <- storm.all %>%
+  pull(duration) %>%
+  max
+storm.min.duration <- storm.all %>%
+  pull(duration) %>%
+  min
+id.thresholds <- tibble(
+      model = as.factor(c('Guzzetti et al. (2008) Csa', 
+                          'Guzzetti et al. (2008) Csb', 
+                          'Crosta and Frattini (2001)',
+                          'Clarizia et al. (1996)')),
+      beta0 =        c(0,     0,     0.48,  0),
+      beta1 =        c(4.81,  3.57, 7.2,   10),
+      beta2 =        c(-0.49, -0.41, -1.0,  -0.77),
+      min.duration = c(0.1,   0.167,  0.1,  0.1),
+      max.duration = c(1000,  500,    1000, 1000),
+      restriction = c('csa', 'csb', 'both', 'landslide'),
+      facet.row = c('koppen', 'koppen', 'type', 'type')
+    ) %>%
+  mutate(min.duration = max(min.duration, storm.min.duration),
+         max.duration = min(max.duration, storm.max.duration),
+         func = pmap(list(beta0, beta1, beta2), 
+                     ~function (d) beta0 + beta1*d^beta2),
+         geom = pmap(list(model, restriction, 
+                          beta0, beta1, beta2, 
+                          min.duration, max.duration),
+                     ~geom_function(aes(x = duration, linetype = ..1, 
+                                        color = str_c('true.', ..2)), 
+                                    fun=function (d) ..3 + ..4*d^..5)))
+
+plot.idthresh <- function (data, thresholds, labels=c('a', 'b', 'c', 'd')) {
+  plt <- data %>% 
+    left_join(slide, by = 'slide.id') %>%
+    #filter(lon < -115) %>%
+    arrange(is.trigger) %>% 
+    mutate(is.trigger = ifelse(is.trigger, 'true', 'false')) %>%
+    ggplot() +
+    facet_grid(cols = vars(source)) +
+    geom_point(aes(x = duration, y = intensity, 
+                   color = interaction(is.trigger, restriction),
+                   alpha = is.trigger)) +
+    list(thresholds$geom) +
+    scale_x_log10('Duration (h)',
+                  breaks = c(1, 12, 24, 100, 1000)) +
+    scale_y_log10('Intensity (mm/h)') +
+    scale_color_brewer('', 
+                       palette = 'Paired', 
+                       breaks = c('true.csa',
+                                  'false.csa',
+                                  'true.csb',
+                                  'false.csb',
+                                  'true.landslide',
+                                  'false.landslide',
+                                  'true.mudslide',
+                                  'false.mudslide',
+                                  'true.both'),
+                       labels = c('true.csa'='Landslide-triggering storms (Csa)',
+                                  'false.csa'='All storms 2015-2018 (Csa)',
+                                  'true.csb'='Landslide-triggering storms (Csb)',
+                                  'false.csb'='All storms 2015-2018 (Csb)',
+                                  'true.landslide'='Landslide triggering storms (Landslide)',
+                                  'false.landslide'='All storms 2015-2018 (Landslide)',
+                                  'true.mudslide'='Landslide triggering storms (Mudslide or debris flow)',
+                                  'false.mudslide'='All storms 2015-2018 (Mudslide or debris flow)',
+                                  'true.both'='Landslide or mudslide'),
+                       drop = F,
+                       guide = guide_legend(ncol= 2, byrow = 2, 
+                                            override.aes = list(linetype=0))) +
+    scale_alpha_manual('',
+                       values = c('true'=0.8,'false'=0.1),
+                       labels = c('true'='Landslide-triggering storms',
+                                  'false'='All storms 2015-2020'),
+                       guide = F)  +
+    scale_linetype_manual(values = c('solid', 'dotted', 'dotdash', 'dashed'),
+                          drop=F,
+                          guide = guide_legend(ncol= 2, title.position = 'top',
+                                               override.aes = list(color = c('#33a02c', #green
+                                                                             '#6a3d9a', #purple
+                                                                             '#1f78b4', #blue
+                                                                             '#e31a1c')))) + #red
+    labs(linetype='Intensity-duration thresholds:') +
+    theme_bw() +
+    theme(strip.background = element_rect(fill=strip.background))
+  lay <- ggplot_build(plt)$layout
+  scales.x <- lay$panel_scales_x
+  scales.y <- lay$panel_scales_y
+  label.df <- tibble(x = map_dbl(scales.x, ~10^(.$range$range[2])), 
+                     y = map_dbl(scales.y, ~10^(.$range$range[2])),
+                     facet_label = labels,
+                     source = fct_unique(data$source))
+  plt + 
+    geom_label(data = label.df, aes(x = x, y = y, label = facet_label),
+               vjust = 1, hjust = 1)
+}
+
+idthresh.df <- storm.all %>%
+  right_join(slide %>% select(slide.id, type, is.exact), by='slide.id') %>%
+  mutate(restriction = type, facet.row = 'type') %>%
+  filter(type %in% c('Landslide', 'Mudslide or debris flow')) %>%
+  bind_rows(storm.all %>%
+              right_join(slide %>% select(slide.id, koppen, is.exact), by='slide.id') %>%
+              mutate(restriction = koppen, facet.row = 'koppen') %>%
+              filter(str_detect(koppen, '^Cs(a|b)'))) %>%
+  select(-koppen, -type) %>%
+  mutate(facet.row = factor(facet.row),
+         restriction = factor(restriction),
+         restriction = fct_recode(restriction,
+                                  'csa' = 'Csa: Temperate, dry summer, hot summer',
+                                  'csb' = 'Csb: Temperate, dry summer, warm summer',
+                                  'landslide' = 'Landslide',
+                                  'mudslide' = 'Mudslide or debris flow'),
+         restriction = fct_relevel(restriction, 'csa', 'landslide', 'csb', 'mudslide'),
+         restriction = fct_expand(restriction, 'both')) %>%
+  sample_frac()
+```
+```{r fig.width = 4.5, fig.height = 2}
+plot.idthresh(idthresh.df %>% filter(facet.row=='type'),
+              id.thresholds %>% filter(facet.row=='type')) + 
+  theme(legend.position = 'bottom',
+        legend.box="vertical")
+```
+
+```{r plot_idt_combo, fig.height=5, fig.width=4}
+idt.legend.plt <- plot.idthresh(idthresh.df, id.thresholds) +
+  theme(legend.position = 'bottom',
+        legend.box="vertical")
+idt.legend <- get_legend(idt.legend.plt)
+
+idt.koppen.all.plot <- plot.idthresh(idthresh.df %>% filter(facet.row=='koppen'),
+                                     id.thresholds %>% filter(facet.row=='koppen'),
+                            labels = c('a', 'b', 'c', 'd')) +
+  theme(legend.position = "none",
+        axis.title = element_blank())
+
+idt.type.all.plot <- plot.idthresh(idthresh.df %>% filter(facet.row=='type'),
+                                     id.thresholds %>% filter(facet.row=='type'),
+                            labels = c('e', 'f', 'g', 'h')) +
+  theme(legend.position = "none",
+        axis.title.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+idt.all.label <- ggdraw() + 
+  draw_grob(rectGrob(gp = gpar(fill = strip.background),
+                     height = unit(.8, "npc"), vjust = 0.48)) +
+  draw_label("All qualifying landslide locations", colour = 'black',
+             x = 0.1, vjust = -0.3, hjust = 0.5, angle = -90, size=12)
+idt.all <- plot_grid(plot_grid(idt.koppen.all.plot, idt.type.all.plot, ncol = 1), 
+                     idt.all.label, 
+                     nrow = 1, rel_widths = c(1, 0.03))
+
+idt.koppen.exact.plot <- plot.idthresh(idthresh.df %>% filter(facet.row=='koppen', is.exact),
+                                       id.thresholds %>% filter(facet.row=='koppen'),
+                            labels = c('i', 'j', 'k', 'l')) +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+idt.type.exact.plot <- plot.idthresh(idthresh.df %>% filter(facet.row=='type', is.exact),
+                                     id.thresholds %>% filter(facet.row=='type'),
+                            labels = c('m', 'n', 'o', 'p')) +
+  theme(legend.position = "none",
+        axis.title.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+idt.exact.label <- ggdraw() +
+  draw_grob(rectGrob(gp = gpar(fill = strip.background),
+                     height = unit(.84, "npc"), vjust =.44)) +
+  draw_label("Verified landslide locations", colour = 'black',
+             x = 0.1, vjust = -0.3, hjust = .5, angle = -90, size=12)
+idt.exact <- plot_grid(plot_grid(idt.koppen.exact.plot, idt.type.exact.plot, ncol = 1),
+                       idt.exact.label, 
+                       nrow = 1, rel_widths = c(1, 0.03))
+
+idt.y.axis <- ggdraw() +
+  draw_label("Intensity (mm/h)", size = 12,
+             x = 0.1, vjust = 1, hjust = 0.2, angle = 90)
+idt.plots <- plot_grid(idt.all, idt.exact, idt.legend, 
+                           rel_heights = c(3.1, 3, 2), ncol = 1)
+plot_grid(idt.y.axis, idt.plots,
+          nrow = 1, rel_widths = c(0.025, 1))
+
+ggsave('..figures/intensity_duration.png', width = 8, height = 10)
+ggsave('..figures/figure_7_idt.tiff', width = 8, height = 10, dpi=600)
+```
+
+## Intensity-duration distribution comparison
+
+```{r fig.width = 4, fig.height = 2.5}
+convert.range <- function (range) {
+  limits <- 10^as.numeric(str_match_all(range, '-?\\d.\\d\\d')[[1]])
+  limits <- round(limits)
+  str_c(limits[1], 'h < D < ', limits[2], 'h')
+}
+storm.all %>%
+  mutate(duration.band = cut_width(log10(duration), width = 0.5)) %>%
+  mutate(duration.band = fct_relabel(duration.band, ~map_chr(., convert.range))) %>%
+  ggplot() +
+  facet_wrap(vars(duration.band), nrow = 1)  +
+  geom_boxplot(aes(x = source, y = intensity, fill = source)) +
+  scale_y_log10()  +
+  theme_bw() +
+  labs(x = '', fill = '', y = 'Mean intensity (mm/h)') +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = 'bottom')
+
+ggsave('..figures/intensity_duration_distribution.png', width = 8, height = 5)
+ggsave('..figures/figure_8_intensity_duration_distribution.tiff', width = 8, height = 5, dpi=300)
+```
+
+### Scores
+
+```{r}
+calc.threat <- function (data) {
+  data %>%
+    left_join(id.thresholds, by=c('restriction', 'facet.row')) %>%
+    dplyr::select(slide.id, source, is.trigger, intensity, duration) %>%
+    merge(id.thresholds) %>%
+    dplyr::mutate(threshold.intensity = beta0 + beta1 * duration ^ beta2,
+           hit = is.trigger & intensity > threshold.intensity,
+           miss = is.trigger & intensity < threshold.intensity,
+           false.alarm = !is.trigger & intensity > threshold.intensity,
+           true.negative = !is.trigger & intensity < threshold.intensity) %>%
+    dplyr::select(-is.trigger, -intensity, -duration) %>%
+    dplyr::group_by(source, model) %>%
+    dplyr::summarize_at(vars(hit, miss, false.alarm, true.negative), ~sum(., na.rm=T)) %>%
+    dplyr::mutate(n = hit + miss,
+           hit.ratio = hit / (hit + miss),
+           false.alarm.ratio = false.alarm / (false.alarm + true.negative),
+           frequency.bias = (hit + false.alarm) / (hit + miss)) %>%
+    dplyr::mutate_at(vars(-source, -model), ~round(., digits = 2))
+}
+idthresh.df %>% group_by(is.exact) %>%tally
+calc.threat(idthresh.df %>%
+              bind_rows(idthresh.df %>% 
+                          filter(restriction %in% c('landslide', 'mudslide')) %>%
+                          mutate(restriction = 'both')) %>%
+              filter(is.exact)) %>%
+  dplyr::select(source, model, hit.ratio, false.alarm.ratio, frequency.bias) %>%
+  dplyr::arrange(source, model) %>%
+  dplyr::mutate(source = as.character(source), model = as.character(model)) %>%
+  stargazer::stargazer(type = "text", summary = F)
+```
+
+### Product comparison summary statistics
+
+```{r}
+storm.freq.max %>%
+  dplyr::select(slide.id, source, depth, duration, frequency, intensity, peak_intensity) %>%
+  gather('measurement', 'value', -slide.id, -source) %>%
+  group_by(slide.id, measurement) %>%
+  summarize(min.value = min(value), max.value = max(value), range = max.value - min.value, n = n()) %>%
+  filter(n > 1) %>%
+  group_by(measurement) %>%
+  summarize(min.range = min(range), max.range = max(range), avg.range = mean(range))
+```
+
+
+
+```{r fig.height=1, fig.width=5}
+trigger.precip%>%
+  group_by(slide.id, source) %>%
+  summarize(frequency = max(frequency)) %>%
+  left_join(storm, by=c('slide.id', 'source')) %>%
+  mutate(frequency = 1 / frequency) %>%
+  dplyr::select(slide.id, source, depth, duration, frequency, intensity, peak_intensity) %>%
+  gather('measurement', 'value', -slide.id, -source) %>%
+  mutate(measurement = as_factor(measurement)) %>%
+  mutate(measurement = fct_recode(measurement,
+                                  `Depth (mm)` = 'depth',
+                                  `Duration (h)` = 'duration',
+                                  `Frequency (1/yr)` = 'frequency',
+                                  `Total intensity (mm/h)` = 'intensity',
+                                  `Peak hourly intensity (mm/h)` = 'peak_intensity'))%>%
+  ggplot(aes(x = source, y = value, group = source, fill = source)) +
+  facet_wrap(facets = vars(measurement), nrow = 1, 
+             scales = 'free',
+             labeller = label_wrap_gen()) +
+  geom_violin() +
+  geom_boxplot(width=0.1, fill='white') +
+  labs(x = '', y= '') +
+  scale_fill_discrete(guide=F) +
+  theme_bw()
+```
+
+```{r}
+trigger.precip %>%
+  dplyr::select(slide.id, source, frequency) %>%
+  mutate(frequency = as_factor(frequency)) %>%
+  ggplot(aes(x = frequency, y = ..prop..,  group = source, fill = source)) +
+  geom_bar(position = position_dodge()) +
+  theme_minimal() +
+  labs(x = 'Return interval', y = 'Proportion of landslide-triggering storms')
+ggsave('..figures/frequency_histogram.png', width = 6, height = 4)
+```
+
+
+
+```{r}
+storm.all %>%
+  group_by(slide.id) %>%
+  
+  arrange(is.trigger) %>%
+  ggplot(aes(x = duration, y = intensity, color = is.trigger)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(values = c(`FALSE`='grey', `TRUE` = 'blue'), guide = F) +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
